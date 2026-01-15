@@ -1,557 +1,402 @@
 # -*- coding: utf-8 -*-
 """
-NgânMiu.Store - Cookie Check API (Vercel Ready)
-✅ Endpoints:
-  - GET  /api/ping
-  - POST /api/check-cookie
-
-Mặc định:
-  - list_limit = 5 (lấy tối đa 5 order_id đầu)
-  - max_orders = 4 (trả tối đa 4 đơn hợp lệ)
+NgânMiu.Store - Check Cookie API (Vercel)
+✅ Added Google Sheet ID key activation
+- Store keys in KEY_DB_SHEET_ID -> tab "KeyGGSheet"
+- Columns: STT | Google Sheet ID | Trạng Thái (Chưa Kích / Kích Hoạt)
+- Each sheet_id is checked with TTL cache (default 60 minutes, best-effort)
 """
 
+import os, time, json, random
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
-import requests, re
-from collections import deque
-from datetime import datetime
+import requests
 
-# ========= Flask =========
+# ---- Google Sheets (KeyGGSheet) ----
+import gspread
+from google.oauth2.service_account import Credentials
+
 app = Flask(__name__)
 
-# ========= Shopee API config =========
-UA   = "Android app Shopee appver=28320 app_type=1"
-BASE = "https://shopee.vn/api/v4"
+# ---- Key check cache (best-effort) ----
+_KEY_TTL_SECONDS = int(os.getenv('KEY_TTL_SECONDS', '3600'))  # 60m default
+_key_cache = {}  # sheet_id -> {'ts': epoch, 'active': bool}
 
-DEFAULT_LIST_LIMIT = 5
-DEFAULT_MAX_ORDERS = 4
+# =======================
+# Config
+# =======================
+UA = os.getenv("SHOPEE_UA", "Android app Shopee appver=28320 app_type=1")
+BASE = os.getenv("SHOPEE_BASE", "https://shopee.vn/api/v4")
+POST_TIMEOUT = float(os.getenv("POST_TIMEOUT", "8"))
 
-# ================= HTTP =================
-def build_headers(cookie: str) -> dict:
-    return {
-        "User-Agent": UA,
-        "Cookie": cookie.strip(),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Referer": "https://shopee.vn/",
-    }
+# Key database sheet (central)
+KEY_DB_SHEET_ID = os.getenv("KEY_DB_SHEET_ID", "").strip()
 
-def http_get(url: str, headers: dict, params: dict | None = None, timeout: int = 12):
+# Service account JSON in env (recommended on Vercel)
+# Put raw JSON string into GOOGLE_SERVICE_ACCOUNT_JSON env var
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+# Message when not activated
+NOT_ACTIVE_MSG = os.getenv(
+    "NOT_ACTIVE_MSG",
+    "Key chưa kích hoạt vui lòng liên hệ zalo : 0819-555-000"
+)
+
+# best-effort daily cache (serverless may reset on cold start)
+_daily_key_cache = {}  # sheet_id -> {"date":"YYYY-MM-DD","active":bool}
+
+def _today_key():
+    # use Asia/Ho_Chi_Minh like VN local date; approximate by UTC+7
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    vn = now.astimezone(timezone.utc).timestamp() + 7*3600
+    dt = datetime.utcfromtimestamp(vn)
+    return dt.strftime("%Y-%m-%d")
+
+def _make_gspread_client():
+    if not KEY_DB_SHEET_ID:
+        raise RuntimeError("Missing KEY_DB_SHEET_ID in env.")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON in env.")
+
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def _ensure_key_sheet(ws):
+    # Ensure headers + dropdown validation (best-effort)
+    headers = ["STT", "Google Sheet ID", "Trạng Thái"]
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if "application/json" in (r.headers.get("Content-Type") or ""):
-            return r.status_code, r.json()
-        return r.status_code, {"raw": r.text}
-    except requests.RequestException as e:
-        return 0, {"error": str(e)}
+        first = ws.row_values(1)
+        if [c.strip() for c in first[:3]] != headers:
+            ws.update("A1:C1", [headers])
+            ws.format("A1:C1", {"textFormat": {"bold": True}})
+    except Exception:
+        pass
 
-# ================= JSON helpers =================
-def find_first_key(data, key):
-    dq = deque([data])
-    while dq:
-        cur = dq.popleft()
-        if isinstance(cur, dict):
-            if key in cur:
-                return cur[key]
-            dq.extend(v for v in cur.values() if isinstance(v, (dict, list)))
-        elif isinstance(cur, list):
-            dq.extend(x for x in cur if isinstance(x, (dict, list)))
-    return None
+def _get_or_create_key_worksheet(gc):
+    sh = gc.open_by_key(KEY_DB_SHEET_ID)
 
-def bfs_values_by_key(data, target_keys=("order_id",)):
-    out, dq, tset = [], deque([data]), set(target_keys)
-    while dq:
-        cur = dq.popleft()
-        if isinstance(cur, dict):
-            for k, v in cur.items():
-                if k in tset:
-                    out.append(v)
-                if isinstance(v, (dict, list)):
-                    dq.append(v)
-        elif isinstance(cur, list):
-            dq.extend(cur)
-    return out
+    try:
+        ws = sh.worksheet("KeyGGSheet")
+    except Exception:
+        ws = sh.add_worksheet(title="KeyGGSheet", rows=2000, cols=5)
+    _ensure_key_sheet(ws)
+    return ws
 
-def as_text(val):
-    if isinstance(val, dict):
-        return (
-            val.get("text") or val.get("label") or val.get("value") or val.get("desc")
-            or val.get("title") or val.get("subtitle") or val.get("sub_title")
-            or val.get("tip") or val.get("tips")
-        )
-    if isinstance(val, list) and val:
-        f = val[0]
-        if isinstance(f, dict):
-            return (
-                f.get("text") or f.get("label") or f.get("value") or f.get("desc")
-                or f.get("title") or f.get("subtitle") or f.get("sub_title")
-                or f.get("tip") or f.get("tips")
-            )
-        if isinstance(f, str):
-            return f
-    return val
+def _normalize_status(s: str) -> str:
+    t = (s or "").strip()
+    # accept variants
+    if t.lower().replace(" ", "") in ["kichhoat", "kíchhoạt", "kíchhoat", "active", "activated"]:
+        return "Kích Hoạt"
+    return "Chưa Kích"
 
-def normalize_image_url(s):
-    if not isinstance(s, str) or not s:
-        return None
-    s = s.strip()
-    if s.startswith("//"):
-        return "https:" + s
-    if s.startswith("/file/"):
-        return "https://cf.shopee.vn" + s
-    if s.startswith("http"):
-        return s
-    if re.fullmatch(r"[A-Za-z0-9\-_]{20,}", s):
-        return f"https://cf.shopee.vn/file/{s}"
-    return s
-
-def fmt_ts(ts):
-    if isinstance(ts, str) and ts.isdigit():
-        ts = int(ts)
-    if isinstance(ts, (int, float)) and ts > 1_000_000:
-        try:
-            return datetime.fromtimestamp(int(ts)).strftime("%H:%M %d-%m-%Y")
-        except Exception:
-            return str(ts)
-    return str(ts) if ts is not None else None
-
-def normalize_status_text(status: str) -> str:
-    if not isinstance(status, str):
-        return ""
-    s = status.strip()
-    s = re.sub(r"^tình trạng\s*:?\s*", "", s, flags=re.I)
-    s = re.sub(r"^[\s\N{VARIATION SELECTOR-16}\uFE0F\U0001F300-\U0001FAFF]+", "", s)
-    return s.strip()
-
-def is_shopee_processing_text(status: str) -> bool:
-    s = normalize_status_text(status).lower()
-    return bool(
-        re.search(r"đơn\s*hàng.*đang.*(được)?\s*xử lý.*shopee", s)
-        or re.search(r"processing.*by.*shopee", s)
-    )
-
-# ================= Status map (Shopee CODE MAP) =================
-CODE_MAP = {
-    "order_status_text_to_receive_delivery_done": ("✅ Giao hàng thành công", "success"),
-    "order_tooltip_to_receive_delivery_done":     ("✅ Giao hàng thành công", "success"),
-    "label_order_delivered":                      ("✅ Giao hàng thành công", "success"),
-    "order_list_text_to_receive_non_cod":         ("🚚 Đang chờ nhận", "info"),
-    "label_to_receive":                           ("🚚 Đang chờ nhận", "info"),
-    "label_order_to_receive":                     ("🚚 Đang chờ nhận", "info"),
-    "label_order_to_ship":                        ("📦 Chờ giao hàng", "warning"),
-    "label_order_being_packed":                   ("📦 Đang chuẩn bị", "warning"),
-    "label_order_processing":                     ("🔄 Đang xử lý", "warning"),
-    "label_order_paid":                           ("💰 Đã thanh toán", "info"),
-    "label_order_unpaid":                         ("💸 Chưa thanh toán", "info"),
-    "label_order_waiting_shipment":               ("📦 Chờ bàn giao", "info"),
-    "label_order_shipped":                        ("🚛 Đã bàn giao", "info"),
-    "label_order_delivery_failed":                ("❌ Giao thất bại", "danger"),
-    "label_order_cancelled":                      ("❌ Đã hủy", "danger"),
-    "label_order_return_refund":                  ("↩️ Trả hàng", "info"),
-    "order_list_text_to_ship_ship_by_date_not_calculated": ("🎖 Chờ duyệt", "warning"),
-    "order_status_text_to_ship_ship_by_date_not_calculated": ("🎖 Chờ duyệt", "warning"),
-    "label_ship_by_date_not_calculated": ("🎖 Chờ duyệt", "warning"),
-    "label_preparing_order": ("📦 Chờ shop gửi", "warning"),
-    "order_list_text_to_ship_order_shipbydate": ("📦 Chờ shop gửi", "warning"),
-    "order_status_text_to_ship_order_shipbydate": ("📦 Chuẩn bị hàng", "warning"),
-    "order_list_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi", "warning"),
-    "order_status_text_to_ship_order_shipbydate_cod": ("📦 Chờ shop gửi", "warning"),
-    "order_status_text_to_ship_order_edt_cod": ("📦 Chờ shop gửi", "warning"),
-    "order_status_text_to_ship_order_edt_cod_range": ("📦 Chờ duyệt", "warning"),
-}
-
-def map_code(code):
-    if not isinstance(code, str):
-        return None, "secondary"
-    return CODE_MAP.get(code, (code, "secondary"))
-
-# ================= Cancel helpers =================
-def tree_contains_str(data, target: str) -> bool:
-    if isinstance(data, dict):
-        for v in data.values():
-            if tree_contains_str(v, target):
-                return True
-    elif isinstance(data, list):
-        for v in data:
-            if tree_contains_str(v, target):
-                return True
-    elif isinstance(data, str):
-        return data == target
-    return False
-
-def is_buyer_cancelled(detail_raw: dict) -> bool:
-    d = detail_raw if isinstance(detail_raw, dict) else {}
-    if tree_contains_str(d, "order_status_text_cancelled_by_buyer"):
-        return True
-
-    who = (
-        find_first_key(d, "cancel_by")
-        or find_first_key(d, "canceled_by")
-        or find_first_key(d, "cancel_user_role")
-        or find_first_key(d, "initiator")
-        or find_first_key(d, "operator_role")
-        or find_first_key(d, "operator")
-    )
-    if isinstance(who, dict):
-        who = as_text(who)
-    who_s = (str(who or "")).lower()
-
-    reason = (
-        find_first_key(d, "cancel_reason")
-        or find_first_key(d, "buyer_cancel_reason")
-        or find_first_key(d, "cancel_desc")
-        or find_first_key(d, "cancel_description")
-        or find_first_key(d, "reason")
-    )
-    if isinstance(reason, dict):
-        reason = as_text(reason)
-    reason_s = (str(reason or "")).lower()
-
-    status_label = (as_text(find_first_key(d, "status_label")) or "").lower()
-    is_cancel_status = (
-        ("cancel" in status_label)
-        or ("hủy" in status_label)
-        or ("cancel" in reason_s)
-        or ("hủy" in reason_s)
-    )
-    buyer_flags = ("buyer", "user", "customer", "người mua")
-
-    if is_cancel_status and any(k in who_s or k in reason_s for k in buyer_flags):
-        return True
-    if "người mua" in reason_s and "hủy" in reason_s:
-        return True
-    return False
-
-# ================= Fetch orders (LIST LIMIT = 5) =================
-def fetch_orders_and_details(cookie: str, list_limit: int = DEFAULT_LIST_LIMIT, offset: int = 0):
+def check_sheet_key_active(sheet_id: str):
     """
-    list_limit=5 để nhẹ khi deploy Vercel.
+    Returns: (active: bool, note: str)
+    - If sheet_id not found: create row with Chưa Kích
+    - Cache best-effort once/day per sheet_id
     """
-    headers = build_headers(cookie)
-    list_url = f"{BASE}/order/get_all_order_and_checkout_list"
+    sheet_id = (sheet_id or "").strip()
+    if not sheet_id:
+        return False, "Missing sheet_id"
 
-    _, data1 = http_get(list_url, headers, params={"limit": int(list_limit), "offset": int(offset)})
-    order_ids = bfs_values_by_key(data1, ("order_id",)) if isinstance(data1, dict) else []
+    now = int(time.time())
+    cached = _key_cache.get(sheet_id)
+    if cached and (now - int(cached.get("ts", 0))) < _KEY_TTL_SECONDS:
+        return bool(cached.get("active")), "cached"
 
-    # unique order_id
-    seen, uniq = set(), []
-    for oid in order_ids:
-        if oid not in seen:
-            seen.add(oid)
-            uniq.append(oid)
+    try:
+        gc = _make_gspread_client()
+        ws = _get_or_create_key_worksheet(gc)
 
-    details = []
-    for oid in uniq[: int(list_limit)]:
-        detail_url = f"{BASE}/order/get_order_detail"
-        _, data2 = http_get(detail_url, headers, params={"order_id": oid})
-        details.append({"order_id": oid, "raw": data2})
+        # Find sheet_id in column B
+        col_b = ws.col_values(2)  # includes header
+        row_idx = None
+        for i, v in enumerate(col_b[1:], start=2):
+            if (v or "").strip() == sheet_id:
+                row_idx = i
+                break
 
-    return {"details": details}
-
-# ================= Extract COD =================
-def extract_cod_amount(d) -> int:
-    """
-    Shopee thường trả amount theo đơn vị nhỏ (x100000)
-    => giữ đúng logic của bạn: amount//100000
-    """
-    for key in ["final_total", "total_amount", "amount", "cod_amount", "buyer_total_amount"]:
-        val = find_first_key(d, key)
-        if val is not None:
-            try:
-                amount = int(val) if isinstance(val, (int, float, str)) else 0
-                if amount > 0:
-                    return amount // 100000
-            except Exception:
-                pass
-    info_card = find_first_key(d, "info_card")
-    if isinstance(info_card, dict):
-        for key in ["final_total", "total"]:
-            val = info_card.get(key)
-            if val:
+        if row_idx is None:
+            # append new row
+            stt = len(col_b)  # header included
+            ws.append_row([stt, sheet_id, "Chưa Kích"])
+            active = False
+        else:
+            status = ws.cell(row_idx, 3).value
+            status_norm = _normalize_status(status)
+            if status_norm != status:
                 try:
-                    return int(val) // 100000
+                    ws.update_cell(row_idx, 3, status_norm)
                 except Exception:
                     pass
-    return 0
+            active = (status_norm == "Kích Hoạt")
 
-def format_currency(amount: int) -> str:
-    if amount <= 0:
-        return "0 đ"
-    return f"{amount:,}".replace(",", ".") + " đ"
+        _key_cache[sheet_id] = {"ts": int(time.time()), "active": active}
+        return active, "ok"
+    except Exception as e:
+        # If key-check fails due to quota/timeout, be safe: deny
+        _key_cache[sheet_id] = {"ts": int(time.time()), "active": False}
+        return False, f"key_check_error: {e}"
 
-# ================= Timeline builder (rút gọn, giữ chất) =================
-TIME_KEYS = ("time","ts","timestamp","ctime","create_time","update_time","event_time","log_time","happen_time","occur_time")
-TEXT_KEYS = ("text","status","description","detail","message","desc","label","note","title","subtitle","sub_title","tip","tips","name","content","status_text","event","event_desc","status_desc","detail_desc")
+# =======================
+# Helpers
+# =======================
+def pick_fp(cookie: str):
+    # keep for future fingerprint usage
+    return ""
 
-def _pick_time(d):
-    for k in TIME_KEYS:
-        if isinstance(d, dict) and k in d and d[k] not in (None, "", []):
-            return d[k]
-    return None
+def _safe_get(d, path, default=""):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+    return cur if cur is not None else default
 
-def _deep_pick_text(obj):
-    if isinstance(obj, dict):
-        for k in TEXT_KEYS:
-            v = obj.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        for v in obj.values():
-            t = _deep_pick_text(v)
-            if t:
-                return t
-    elif isinstance(obj, list):
-        for it in obj:
-            t = _deep_pick_text(it)
-            if t:
-                return t
-    elif isinstance(obj, str):
-        s = obj.strip()
-        if s:
-            return s
-    return None
+def _format_vnd(n):
+    try:
+        return f"{int(n):,}".replace(",", ".") + " đ"
+    except Exception:
+        return ""
 
-def _events_from_lists(obj):
+def parse_order_obj(order_obj):
+    """
+    Map Shopee order detail -> flat schema used by Google Apps Script
+    """
+    if not isinstance(order_obj, dict):
+        return None
+
+    tracking_no = order_obj.get("tracking_no") or order_obj.get("tracking_number") or ""
+    status_text = order_obj.get("status_text") or order_obj.get("status") or ""
+
+    shipping_name = order_obj.get("shipping_name") or _safe_get(order_obj, ["address", "shipping_name"], "")
+    shipping_phone = order_obj.get("shipping_phone") or _safe_get(order_obj, ["address", "shipping_phone"], "")
+    shipping_address = order_obj.get("shipping_address") or _safe_get(order_obj, ["address", "shipping_address"], "")
+
+    shipper_name = order_obj.get("shipper_name") or _safe_get(order_obj, ["shipping", "shipper_name"], "")
+    shipper_phone = order_obj.get("shipper_phone") or _safe_get(order_obj, ["shipping", "shipper_phone"], "")
+
+    product_name = order_obj.get("product_name") or ""
+    product_image = order_obj.get("product_image") or ""
+
+    cod_amount = order_obj.get("cod_amount")
+    cod_display = order_obj.get("cod_display")
+    if cod_amount is None:
+        # fallback from info_card.final_total if present (rare)
+        ft = _safe_get(order_obj, ["info_card", "final_total"], None)
+        if isinstance(ft, (int, float)) and ft > 0:
+            # some schemas have *100000 inflation
+            cod_amount = int(ft // 100000)
+    if cod_display is None and cod_amount not in (None, ""):
+        cod_display = _format_vnd(cod_amount)
+
+    shop_id = order_obj.get("shop_id") or ""
+    shop_username = order_obj.get("shop_username") or order_obj.get("username") or ""
+
+    return {
+        "tracking_no": tracking_no,
+        "status_text": status_text,
+        "shipping_name": shipping_name,
+        "shipping_phone": shipping_phone,
+        "shipping_address": shipping_address,
+        "shipper_name": shipper_name,
+        "shipper_phone": shipper_phone,
+        "product_name": product_name,
+        "product_image": product_image,
+        "cod_amount": cod_amount if cod_amount is not None else "",
+        "cod_display": cod_display or "",
+        "shop_id": shop_id,
+        "shop_username": shop_username,
+        "timeline_preview": order_obj.get("timeline_preview") or [],
+        "timeline_full": order_obj.get("timeline_full") or [],
+    }
+
+# =======================
+# Shopee fetch
+# =======================
+def shopee_headers(cookie: str):
+    return {
+        "user-agent": UA,
+        "accept": "application/json",
+        "content-type": "application/json",
+        "cookie": cookie or "",
+        "referer": "https://shopee.vn/",
+    }
+
+def fetch_orders_list(cookie: str, list_limit: int = 5):
+    # This endpoint name can vary; keep generic pattern
+    # Using a common one for order list:
+    url = f"{BASE}/order/get_all_order_and_checkout_list"
+    payload = {
+        "limit": int(list_limit),
+        "offset": 0
+    }
+    r = requests.post(url, headers=shopee_headers(cookie), json=payload, timeout=POST_TIMEOUT)
+    return r.status_code, r.text
+
+def fetch_order_detail(cookie: str, order_id: int):
+    # Typical endpoint for order detail:
+    url = f"{BASE}/order/get_order_detail"
+    payload = {"order_id": int(order_id)}
+    r = requests.post(url, headers=shopee_headers(cookie), json=payload, timeout=POST_TIMEOUT)
+    return r.status_code, r.text
+
+def extract_order_ids(list_json):
+    """
+    Try multiple possible paths to get order ids.
+    """
+    if not isinstance(list_json, dict):
+        return []
+    # Common patterns:
+    # data.order_list or data.orders
+    data = list_json.get("data") or {}
+    ids = []
+
+    # pattern A: data.order_list (list of dict with order_id)
+    ol = data.get("order_list")
+    if isinstance(ol, list):
+        for x in ol:
+            oid = x.get("order_id") if isinstance(x, dict) else None
+            if isinstance(oid, int):
+                ids.append(oid)
+
+    # pattern B: data.orders
+    od = data.get("orders")
+    if isinstance(od, list):
+        for x in od:
+            oid = x.get("order_id") if isinstance(x, dict) else None
+            if isinstance(oid, int):
+                ids.append(oid)
+
+    # pattern C: data.order_cards
+    cards = data.get("order_cards")
+    if isinstance(cards, list):
+        for c in cards:
+            oid = c.get("order_id") if isinstance(c, dict) else None
+            if isinstance(oid, int):
+                ids.append(oid)
+
+    # unique keep order
+    seen = set()
     out = []
-    def walk(o):
-        if isinstance(o, dict):
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for it in o:
-                if isinstance(it, dict):
-                    ts = _pick_time(it) or _pick_time({"_": it})
-                    txt = _deep_pick_text(it)
-                    if txt and (ts is not None):
-                        out.append((ts, txt))
-                walk(it)
-    walk(obj)
+    for oid in ids:
+        if oid not in seen:
+            seen.add(oid)
+            out.append(oid)
     return out
 
-def build_rich_timeline(d):
-    raw = []
-    raw += _events_from_lists(d)
-    rows = []
-    for ts, txt in raw:
-        if txt and txt not in [r[1] for r in rows]:
-            ts_val = fmt_ts(ts) if ts is not None else None
-            rows.append((ts_val, txt))
-    rows.sort(key=lambda x: x[0] if x[0] else "", reverse=True)
-    p = rows[:3] if len(rows) > 3 else rows
-    return p, rows
-
-def first_image(obj):
-    for k in ("image","img","thumb","thumbnail","cover","photo","pic","icon","product_image","item_image"):
-        v = find_first_key(obj, k)
-        if isinstance(v, str):
-            return normalize_image_url(v)
-        if isinstance(v, list):
-            for x in v:
-                if isinstance(x, str):
-                    return normalize_image_url(x)
-                if isinstance(x, dict):
-                    for kk in ("url","image","thumbnail"):
-                        u = x.get(kk)
-                        if isinstance(u, str):
-                            return normalize_image_url(u)
-    items = find_first_key(obj, "card_item_list") or find_first_key(obj, "items")
-    if isinstance(items, list):
-        for it in items:
-            if isinstance(it, dict):
-                for kk in ("image","thumbnail","cover","img"):
-                    u = it.get(kk)
-                    if isinstance(u, str):
-                        return normalize_image_url(u)
-    return None
-
-def first_tracking_number(obj):
-    for k in ("tracking_number","tracking_no","tracking_num","trackingid","waybill","waybill_no","awb","billcode","bill_code","consignment_no","cn_number","shipment_no"):
-        v = find_first_key(obj, k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    tinfo = find_first_key(obj, "tracking_info")
-    if isinstance(tinfo, dict):
-        t = tinfo.get("tracking_number") or tinfo.get("tracking_no")
-        if isinstance(t, str) and t.strip():
-            return t.strip()
-    return None
-
-def build_status_text_and_color(d):
-    # ưu tiên tracking_info
-    tinfo = find_first_key(d, "tracking_info")
-    if isinstance(tinfo, dict):
-        desc = tinfo.get("description") or tinfo.get("text") or tinfo.get("status_text")
-        if isinstance(desc, str) and desc.strip():
-            desc_norm = normalize_status_text(desc)
-            if "hủy" in desc_norm.lower() or "cancel" in desc_norm.lower():
-                return desc_norm, "danger"
-            if is_shopee_processing_text(desc):
-                return "🎖 Shopee đang xử lý", "info"
-            dl = desc_norm.lower()
-            if (
-                re.search(r"(chuẩn|chuan)\s*bi.*h(à|a)ng", dl)
-                or re.search(r"ch(ờ|o)\s*shop\s*g(ử|u)i", dl)
-                or re.search(r"người\s*g(ử|u)i\s*đang\s*chuẩn\s*bị\s*h(à|a)ng", dl)
-                or re.search(r"(prepar|packing|to\s*ship|ready\s*to\s*ship)", dl)
-            ):
-                return desc_norm, "warning"
-            if ("không" in dl or "fail" in dl or "failed" in dl or "unsuccess" in dl):
-                return desc_norm, "danger"
-            if (("giao hàng" in dl or "giao thành công" in dl or "delivered" in dl) and ("không" not in dl)):
-                return desc_norm, "success"
-            if any(kw in dl for kw in ["đang vận chuyển", "đang giao", "in transit", "out for delivery"]):
-                return desc_norm, "info"
-            return desc_norm, "info"
-
-    status = find_first_key(d, "status") or {}
-    if isinstance(status, dict):
-        for code in [
-            as_text(status.get("header_text")),
-            as_text(status.get("list_view_text")),
-            as_text(status.get("status_label")),
-            as_text(status.get("list_view_status_label")),
-        ]:
-            if isinstance(code, str):
-                if "processing" in code.lower():
-                    return "🎖 Shopee đang xử lý", "info"
-                t, c = map_code(code)
-                if t:
-                    return t, c
-
-    code = as_text(find_first_key(d, "status_label")) or as_text(find_first_key(d, "list_view_status_label"))
-    t, c = map_code(code)
-    if isinstance(t, str) and is_shopee_processing_text(t):
-        return "🎖 Shopee đang xử lý", "info"
-    return t, c
-
-def extract_shop_info(d):
-    username = None
-    shop_id = None
-    si = find_first_key(d, "shop_info")
-    if isinstance(si, dict):
-        username = si.get("username") or username
-        shop_id  = si.get("shop_id")  or shop_id
-    return username, shop_id
-
-def pick_columns_from_detail(detail_raw: dict) -> dict:
-    d = detail_raw if isinstance(detail_raw, dict) else {}
-    s = {}
-
-    txt, col = build_status_text_and_color(d)
-    s["status_text"]  = txt or "—"
-    s["status_color"] = col or "secondary"
-
-    cod_amount = extract_cod_amount(d)
-    s["cod_amount"] = cod_amount
-    s["cod_display"] = format_currency(cod_amount)
-
-    rec_addr = find_first_key(d, "recipient_address") or {}
-    if not isinstance(rec_addr, dict):
-        rec_addr = {}
-
-    s["shipping_address"] = find_first_key(d, "shipping_address") or rec_addr.get("full_address")
-    s["shipping_name"]    = find_first_key(d, "shipping_name") or rec_addr.get("name") or find_first_key(d, "recipient_name")
-    s["shipping_phone"]   = find_first_key(d, "shipping_phone") or rec_addr.get("phone")
-
-    s["shipper_name"]     = find_first_key(d, "driver_name")
-    s["shipper_phone"]    = find_first_key(d, "driver_phone")
-
-    s["product_image"]    = normalize_image_url(find_first_key(d, "image")) or first_image(d)
-    s["tracking_no"]      = first_tracking_number(d)
-    s["shop_username"], s["shop_id"] = extract_shop_info(d)
-
-    # Product name (đơn giản nhưng đủ ổn)
-    product_name = None
-    items = find_first_key(d, "items") or find_first_key(d, "card_item_list") or find_first_key(d, "order_items")
-    if isinstance(items, list) and items:
-        first_item = items[0]
-        if isinstance(first_item, dict):
-            product_name = (
-                first_item.get("name")
-                or first_item.get("item_name")
-                or first_item.get("product_name")
-                or first_item.get("model_name")
-            )
-    if not product_name:
-        product_name = find_first_key(d, "product_name") or find_first_key(d, "item_name") or find_first_key(d, "name")
-
-    s["product_name"] = product_name if isinstance(product_name, str) else None
-
-    preview, full = build_rich_timeline(d)
-    s["timeline_preview"] = preview
-    s["timeline_full"] = full
-
-    return s
-
-# ================== Routes ==================
+# =======================
+# Routes
+# =======================
 @app.get("/api/ping")
-def api_ping():
+def ping():
     return jsonify({"ok": True})
 
+
+@app.post("/api/request-activation")
+def api_request_activation():
+    """Register current Google Sheet ID into KeyGGSheet (create row if missing)."""
+    body = request.get_json(silent=True) or {}
+    sheet_id = (body.get("sheet_id") or "").strip()
+    sheet_name = (body.get("sheet_name") or "").strip()
+
+    if not sheet_id:
+        return jsonify({"ok": False, "message": "Missing sheet_id"}), 400
+
+    try:
+        gc = _make_gspread_client()
+        ws = _get_or_create_key_worksheet(gc)
+
+        # Find in column B
+        col_b = ws.col_values(2)
+        row_idx = None
+        for i, v in enumerate(col_b[1:], start=2):
+            if (v or "").strip() == sheet_id:
+                row_idx = i
+                break
+
+        if row_idx is None:
+            stt = len(col_b)
+            ws.append_row([stt, sheet_id, "Chưa Kích"], value_input_option="USER_ENTERED")
+            row_idx = stt + 1
+
+        # optional: update a note/name in col D if you later add it
+        msg = "Đã gửi yêu cầu kích hoạt"
+        if sheet_name:
+            msg += f" ({sheet_name})"
+        return jsonify({"ok": True, "message": msg, "row": row_idx})
+    except Exception as e:
+        return jsonify({"ok": False, "message": "Key DB error", "detail": str(e)}), 500
+
+
 @app.post("/api/check-cookie")
-def api_check_cookie_single():
-    """
-    API check cookie cho Google Sheet / Apps Script
-    - list_limit = 5 (nhẹ)
-    - trả tối đa max_orders = 4 đơn hợp lệ
+def check_cookie():
+    body = request.get_json(silent=True) or {}
+    cookie = (body.get("cookie") or "").strip()
+    sheet_id = (body.get("sheet_id") or body.get("google_sheet_id") or "").strip()
+    list_limit = int(body.get("list_limit") or 5)
+    max_orders = int(body.get("max_orders") or 4)
 
-    Body JSON:
-      {
-        "cookie": "SPC_ST=....",
-        "max_orders": 4        # optional
-        "list_limit": 5        # optional
-      }
-    """
-    data = request.get_json(silent=True) or {}
-    cookie = (data.get("cookie") or "").strip()
-    if not cookie:
-        return jsonify({"error": "Missing cookie"}), 400
-
-    # cho phép override (nếu bạn muốn)
-    max_orders = data.get("max_orders", DEFAULT_MAX_ORDERS)
-    list_limit = data.get("list_limit", DEFAULT_LIST_LIMIT)
-
-    try:
-        max_orders = max(1, min(int(max_orders), 10))
-    except Exception:
-        max_orders = DEFAULT_MAX_ORDERS
-
-    try:
-        list_limit = max(1, min(int(list_limit), 20))
-    except Exception:
-        list_limit = DEFAULT_LIST_LIMIT
-
-    fetched = fetch_orders_and_details(cookie, list_limit=list_limit, offset=0)
-    details = fetched.get("details", []) if isinstance(fetched, dict) else []
-
-    picked = []
-    for det in details:
-        raw = det.get("raw") or {}
-        # skip đơn bị buyer hủy
-        if is_buyer_cancelled(raw):
-            continue
-
-        s = pick_columns_from_detail(raw)
-
-        # đơn "hợp lệ" khi có tracking hoặc status khác rỗng
-        if s.get("tracking_no") or (s.get("status_text") not in (None, "", "—")):
-            picked.append(s)
-
-        if len(picked) >= max_orders:
-            break
-
-    if not picked:
-        # giữ đúng kiểu “cookie die” như bản gốc
+    # ---- Key gate ----
+    active, note = check_sheet_key_active(sheet_id)
+    if not active:
         return jsonify({
-            "data": None,
-            "data_list": [],
             "count": 0,
-            "message": "Cookie khóa/hết hạn hoặc không có đơn hợp lệ"
-        })
+            "error": 1,
+            "message": NOT_ACTIVE_MSG,
+            "data": None,
+            "data_list": []
+        }), 200
 
-    return jsonify({
-        "data": picked[0],
-        "data_list": picked,
-        "count": len(picked)
-    })
+    if not cookie:
+        return jsonify({"error": 1, "message": "Missing cookie", "count": 0, "data": None, "data_list": []}), 400
 
-# Vercel needs "app" exported
-# (this file is used as api/index.py)
+    # ---- Fetch list ----
+    try:
+        code, text = fetch_orders_list(cookie, list_limit=list_limit)
+        if code < 200 or code >= 300:
+            return jsonify({"error": 1, "message": f"HTTP {code}", "raw": text[:500]}), 200
+
+        try:
+            j = json.loads(text)
+        except Exception:
+            return jsonify({"error": 1, "message": "Invalid JSON list"}), 200
+
+        order_ids = extract_order_ids(j)
+        if not order_ids:
+            # alive but no orders
+            return jsonify({"count": 0, "data": None, "data_list": []}), 200
+
+        order_ids = order_ids[:max_orders]
+
+        data_list = []
+        for oid in order_ids:
+            d_code, d_text = fetch_order_detail(cookie, oid)
+            if d_code < 200 or d_code >= 300:
+                continue
+            try:
+                d_j = json.loads(d_text)
+            except Exception:
+                continue
+            # try common paths
+            obj = (d_j.get("data") or d_j.get("order") or {})
+            mapped = parse_order_obj(obj)
+            if mapped and mapped.get("tracking_no"):
+                data_list.append(mapped)
+
+        if not data_list:
+            return jsonify({"count": 0, "data": None, "data_list": []}), 200
+
+        return jsonify({
+            "count": len(data_list),
+            "data": data_list[0],
+            "data_list": data_list
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": 1, "message": f"server_error: {e}", "count": 0, "data": None, "data_list": []}), 200
