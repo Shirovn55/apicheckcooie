@@ -431,6 +431,50 @@ def extract_shop_info(d):
         shop_id  = si.get("shop_id")  or shop_id
     return username, shop_id
 
+def extract_order_time(d):
+    """
+    Lấy thời gian đặt hàng từ:
+    1. Timeline sự kiện đầu tiên (oldest event)
+    2. Field create_time, ctime, order_time
+    3. Fallback: thời gian hiện tại
+    """
+    # Thử lấy từ các field trực tiếp
+    for key in ["create_time", "ctime", "order_time", "order_create_time", "purchase_time", "placed_time"]:
+        val = find_first_key(d, key)
+        if val is not None:
+            # Convert timestamp sang string
+            if isinstance(val, str) and val.isdigit():
+                val = int(val)
+            
+            if isinstance(val, (int, float)):
+                try:
+                    # Thử timestamp giây
+                    if 1000000000 < val < 9999999999:
+                        dt = datetime.fromtimestamp(int(val))
+                        return dt.strftime("%Y-%m-%d %H:%M:%S")
+                    # Thử timestamp milliseconds
+                    elif 1000000000000 < val < 9999999999999:
+                        dt = datetime.fromtimestamp(int(val) / 1000)
+                        return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            
+            # Nếu đã là string date
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    
+    # Lấy từ timeline (sự kiện cũ nhất = thời gian đặt hàng)
+    _, full_timeline = build_rich_timeline(d)
+    if full_timeline:
+        # Timeline được sort theo thời gian mới nhất → lấy item cuối cùng
+        oldest_event = full_timeline[-1] if full_timeline else None
+        if oldest_event and oldest_event[0]:
+            # oldest_event = (time_str, description)
+            return oldest_event[0]
+    
+    # Fallback: không có data
+    return None
+
 def pick_columns_from_detail(detail_raw: dict) -> dict:
     d = detail_raw if isinstance(detail_raw, dict) else {}
     s = {}
@@ -478,6 +522,9 @@ def pick_columns_from_detail(detail_raw: dict) -> dict:
     preview, full = build_rich_timeline(d)
     s["timeline_preview"] = preview
     s["timeline_full"] = full
+
+    # ✅ THÊM: Thời gian đặt hàng
+    s["order_time"] = extract_order_time(d)
 
     return s
 
