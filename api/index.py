@@ -14,6 +14,7 @@ from flask import Flask, request, jsonify
 import requests, re
 from collections import deque
 from datetime import datetime
+from typing import Optional
 
 # ========= Flask =========
 app = Flask(__name__)
@@ -229,7 +230,7 @@ def fetch_orders_and_details(cookie: str, list_limit: int = DEFAULT_LIST_LIMIT, 
     headers = build_headers(cookie)
     list_url = f"{BASE}/order/get_all_order_and_checkout_list"
 
-    _, data1 = http_get(list_url, headers, params={"limit": int(list_limit), "offset": int(offset)})
+    list_status, data1 = http_get(list_url, headers, params={"limit": int(list_limit), "offset": int(offset)})
     order_ids = bfs_values_by_key(data1, ("order_id",)) if isinstance(data1, dict) else []
 
     # unique order_id
@@ -242,10 +243,18 @@ def fetch_orders_and_details(cookie: str, list_limit: int = DEFAULT_LIST_LIMIT, 
     details = []
     for oid in uniq[: int(list_limit)]:
         detail_url = f"{BASE}/order/get_order_detail"
-        _, data2 = http_get(detail_url, headers, params={"order_id": oid})
-        details.append({"order_id": oid, "raw": data2})
+        detail_status, data2 = http_get(detail_url, headers, params={"order_id": oid})
+        details.append({
+            "order_id": oid,
+            "http_status": detail_status,
+            "raw": data2
+        })
 
-    return {"details": details}
+    return {
+        "list_http_status": list_status,
+        "list_raw": data1,
+        "details": details
+    }
 
 # ================= Extract COD =================
 def extract_cod_amount(d) -> int:
@@ -475,7 +484,34 @@ def extract_order_time(d):
     # Fallback: không có data
     return None
 
-def pick_columns_from_detail(detail_raw: dict) -> dict:
+def extract_order_code(d, fallback: Optional[str] = None) -> Optional[str]:
+    """
+    Ưu tiên các key mã đơn thường gặp của Shopee.
+    Nếu không có thì fallback về order_id lấy từ API list.
+    """
+    key_list = (
+        "order_sn", "orderSn",
+        "order_id", "orderId",
+        "order_code", "orderCode",
+        "order_no", "orderNo",
+        "ordersn", "orderid", "orderno", "ordercode",
+    )
+
+    for k in key_list:
+        v = find_first_key(d, k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+
+    if fallback is not None:
+        s = str(fallback).strip()
+        if s:
+            return s
+    return None
+
+def pick_columns_from_detail(detail_raw: dict, fallback_order_id: Optional[str] = None) -> dict:
     d = detail_raw if isinstance(detail_raw, dict) else {}
     s = {}
 
@@ -525,6 +561,7 @@ def pick_columns_from_detail(detail_raw: dict) -> dict:
 
     # ✅ THÊM: Thời gian đặt hàng
     s["order_time"] = extract_order_time(d)
+    s["order_code"] = extract_order_code(d, fallback=fallback_order_id)
 
     return s
 
@@ -568,6 +605,11 @@ def api_check_cookie_single():
 
     fetched = fetch_orders_and_details(cookie, list_limit=list_limit, offset=0)
     details = fetched.get("details", []) if isinstance(fetched, dict) else []
+    shopee_full = {
+        "list_http_status": fetched.get("list_http_status") if isinstance(fetched, dict) else None,
+        "list_raw": fetched.get("list_raw") if isinstance(fetched, dict) else None,
+        "details_raw": []
+    }
 
     picked = []
     for det in details:
@@ -576,7 +618,15 @@ def api_check_cookie_single():
         if is_buyer_cancelled(raw):
             continue
 
-        s = pick_columns_from_detail(raw)
+        s = pick_columns_from_detail(raw, fallback_order_id=det.get("order_id"))
+        s["order_id"] = str(det.get("order_id")) if det.get("order_id") is not None else None
+        s["shopee_raw"] = raw
+
+        shopee_full["details_raw"].append({
+            "order_id": det.get("order_id"),
+            "http_status": det.get("http_status"),
+            "raw": raw
+        })
 
         # đơn "hợp lệ" khi có tracking hoặc status khác rỗng
         if s.get("tracking_no") or (s.get("status_text") not in (None, "", "—")):
@@ -591,13 +641,15 @@ def api_check_cookie_single():
             "data": None,
             "data_list": [],
             "count": 0,
-            "message": "Cookie khóa/hết hạn hoặc không có đơn hợp lệ"
+            "message": "Cookie khóa/hết hạn hoặc không có đơn hợp lệ",
+            "shopee_full": shopee_full
         })
 
     return jsonify({
         "data": picked[0],
         "data_list": picked,
-        "count": len(picked)
+        "count": len(picked),
+        "shopee_full": shopee_full
     })
 
 # Vercel needs "app" exported
