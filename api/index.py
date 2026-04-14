@@ -11,7 +11,7 @@ Mặc định:
 """
 
 from flask import Flask, request, jsonify
-import requests, re
+import requests, re, time
 from collections import deque
 from datetime import datetime
 from typing import Optional
@@ -22,23 +22,92 @@ app = Flask(__name__)
 # ========= Shopee API config =========
 UA   = "Android app Shopee appver=28320 app_type=1"
 BASE = "https://shopee.vn/api/v4"
+CHECK_URL = f"{BASE}/account/basic/get_account_info"
+SHOPEE_CONFIRM_URL = f"{BASE}/order/action/confirm_order_delivered/"
+SHOPEE_CONFIRM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 
 DEFAULT_LIST_LIMIT = 5
 DEFAULT_MAX_ORDERS = 4
 
 # ================= HTTP =================
+def sanitize_cookie(cookie: str) -> str:
+    raw = str(cookie or "").strip()
+    if not raw:
+        return ""
+    raw = raw.replace("\r", "\n").replace("\t", "")
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    parts = []
+    for piece in re.split(r"[;\n]+", raw):
+        item = piece.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        parts.append(f"{k}={v}")
+    return "; ".join(parts)
+
+def cookie_map(cookie: str) -> dict:
+    out = {}
+    for part in sanitize_cookie(cookie).split(";"):
+        item = part.strip()
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        if k.strip():
+            out[k.strip()] = v.strip()
+    return out
+
 def build_headers(cookie: str) -> dict:
+    ck = sanitize_cookie(cookie)
     return {
         "User-Agent": UA,
-        "Cookie": cookie.strip(),
+        "Cookie": ck,
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Referer": "https://shopee.vn/",
     }
 
+def build_order_header_variants(cookie: str):
+    ck = sanitize_cookie(cookie)
+    ckm = cookie_map(ck)
+    csrf = str(ckm.get("csrftoken") or ckm.get("CSRFTOKEN") or "").strip()
+
+    v1 = build_headers(ck)
+    v2 = {
+        "User-Agent": "Mozilla/5.0",
+        "Cookie": ck,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": "https://shopee.vn/",
+        "X-API-SOURCE": "pc",
+    }
+    v3 = {
+        **v2,
+        "Origin": "https://shopee.vn",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if csrf:
+        v3["x-csrftoken"] = csrf
+        v3["X-CSRFToken"] = csrf
+
+    return [v1, v2, v3]
+
 def http_get(url: str, headers: dict, params: dict | None = None, timeout: int = 12):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if "application/json" in (r.headers.get("Content-Type") or ""):
+            return r.status_code, r.json()
+        return r.status_code, {"raw": r.text}
+    except requests.RequestException as e:
+        return 0, {"error": str(e)}
+
+def http_post(url: str, headers: dict, payload: dict | None = None, timeout: int = 12):
+    try:
+        r = requests.post(url, headers=headers, json=(payload or {}), timeout=timeout)
         if "application/json" in (r.headers.get("Content-Type") or ""):
             return r.status_code, r.json()
         return r.status_code, {"raw": r.text}
@@ -227,10 +296,15 @@ def fetch_orders_and_details(cookie: str, list_limit: int = DEFAULT_LIST_LIMIT, 
     """
     list_limit=5 để nhẹ khi deploy Vercel.
     """
-    headers = build_headers(cookie)
+    variants = build_order_header_variants(cookie)
     list_url = f"{BASE}/order/get_all_order_and_checkout_list"
 
-    list_status, data1 = http_get(list_url, headers, params={"limit": int(list_limit), "offset": int(offset)})
+    list_status, data1 = 0, {}
+    for headers in variants:
+        list_status, data1 = http_get(list_url, headers, params={"limit": int(list_limit), "offset": int(offset)})
+        if list_status == 200 and isinstance(data1, dict):
+            break
+
     order_ids = bfs_values_by_key(data1, ("order_id",)) if isinstance(data1, dict) else []
 
     # unique order_id
@@ -243,7 +317,11 @@ def fetch_orders_and_details(cookie: str, list_limit: int = DEFAULT_LIST_LIMIT, 
     details = []
     for oid in uniq[: int(list_limit)]:
         detail_url = f"{BASE}/order/get_order_detail"
-        detail_status, data2 = http_get(detail_url, headers, params={"order_id": oid})
+        detail_status, data2 = 0, {}
+        for headers in variants:
+            detail_status, data2 = http_get(detail_url, headers, params={"order_id": oid})
+            if detail_status == 200 and isinstance(data2, dict):
+                break
         details.append({
             "order_id": oid,
             "http_status": detail_status,
@@ -565,6 +643,278 @@ def pick_columns_from_detail(detail_raw: dict, fallback_order_id: Optional[str] 
 
     return s
 
+def fetch_shopee_account_info(cookie: str, timeout: int = 10):
+    headers = build_headers(cookie)
+    status, raw = http_get(CHECK_URL, headers, timeout=timeout)
+
+    err_code = None
+    if isinstance(raw, dict):
+        err_code = raw.get("error")
+    live = status == 200 and err_code in (None, 0, "0", "")
+
+    username = find_first_key(raw, "username") if isinstance(raw, dict) else None
+    user_id = find_first_key(raw, "userid") if isinstance(raw, dict) else None
+    if user_id is None and isinstance(raw, dict):
+        user_id = find_first_key(raw, "user_id")
+    phone = find_first_key(raw, "phone") if isinstance(raw, dict) else None
+    email = find_first_key(raw, "email") if isinstance(raw, dict) else None
+    display_name = (
+        find_first_key(raw, "display_name") if isinstance(raw, dict) else None
+    ) or (find_first_key(raw, "name") if isinstance(raw, dict) else None)
+
+    return {
+        "live": bool(live),
+        "http_status": status,
+        "error": (raw.get("error_msg") if isinstance(raw, dict) else "") or "",
+        "raw": raw if isinstance(raw, dict) else {"raw": str(raw)},
+        "user": {
+            "username": username,
+            "user_id": user_id,
+            "phone": phone,
+            "email": email,
+            "display_name": display_name,
+        },
+    }
+
+def parse_cookie_inputs(payload: dict):
+    lines = []
+
+    cookies = payload.get("cookies")
+    if isinstance(cookies, list):
+        for ck in cookies:
+            if isinstance(ck, str) and ck.strip():
+                lines.append(ck.strip())
+
+    cookies_text = payload.get("cookies_text")
+    if isinstance(cookies_text, str) and cookies_text.strip():
+        for ln in cookies_text.replace("\r", "\n").split("\n"):
+            if ln.strip():
+                lines.append(ln.strip())
+
+    one_cookie = payload.get("cookie")
+    if isinstance(one_cookie, str) and one_cookie.strip():
+        lines.append(one_cookie.strip())
+
+    out, seen = [], set()
+    for ln in lines:
+        ck = sanitize_cookie(ln)
+        if not ck:
+            continue
+        if ck in seen:
+            continue
+        seen.add(ck)
+        out.append(ck)
+    return out
+
+def fetch_order_ids_with_meta(cookie: str, limit: int = 6, offset: int = 0, timeout: int = 12):
+    list_url = f"{BASE}/order/get_all_order_and_checkout_list"
+    variants = build_order_header_variants(cookie)
+    last_status, last_data = 0, {}
+
+    for headers in variants:
+        status, data = http_get(
+            list_url,
+            headers,
+            params={"limit": int(limit), "offset": int(offset)},
+            timeout=timeout,
+        )
+        last_status, last_data = status, data
+        if status != 200 or not isinstance(data, dict):
+            continue
+
+        ids = bfs_values_by_key(data, ("order_id",))
+        uniq, seen = [], set()
+        for oid in ids:
+            s = str(oid).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            uniq.append(s)
+
+        if uniq:
+            return uniq, {"status_code": status, "error": ""}
+
+    err = ""
+    if isinstance(last_data, dict):
+        emsg = str(last_data.get("message") or last_data.get("error_msg") or "").strip()
+        ecode = last_data.get("error")
+        if last_status and last_status != 200:
+            err = f"HTTP {last_status}"
+        if ecode not in (None, "", 0, "0"):
+            err = (err + " - " if err else "") + f"error {ecode}"
+        if emsg:
+            err = (err + " - " if err else "") + emsg
+    if not err:
+        err = f"HTTP {last_status or 0}"
+    return [], {"status_code": last_status, "error": err}
+
+def fetch_order_detail_by_id(cookie: str, order_id: str, timeout: int = 12):
+    detail_url = f"{BASE}/order/get_order_detail"
+    variants = build_order_header_variants(cookie)
+    last_status, last_data = 0, {}
+
+    for headers in variants:
+        status, data = http_get(
+            detail_url,
+            headers,
+            params={"order_id": str(order_id)},
+            timeout=timeout,
+        )
+        last_status, last_data = status, data
+        if status == 200 and isinstance(data, dict):
+            return data, {"status_code": status, "error": ""}
+
+    err = ""
+    if isinstance(last_data, dict):
+        emsg = str(last_data.get("message") or last_data.get("error_msg") or "").strip()
+        ecode = last_data.get("error")
+        if last_status and last_status != 200:
+            err = f"HTTP {last_status}"
+        if ecode not in (None, "", 0, "0"):
+            err = (err + " - " if err else "") + f"error {ecode}"
+        if emsg:
+            err = (err + " - " if err else "") + emsg
+    if not err:
+        err = f"HTTP {last_status or 0}"
+    return (last_data if isinstance(last_data, dict) else {}), {"status_code": last_status, "error": err}
+
+def is_delivered_status_text(status: str) -> bool:
+    s = normalize_status_text(status).lower()
+    if not s:
+        return False
+    bad = ("hủy", "huỷ", "cancel", "thất bại", "failed", "return", "refund")
+    if any(k in s for k in bad):
+        return False
+    return (
+        "giao hàng thành công" in s
+        or "giao hang thanh cong" in s
+        or "đã giao" in s
+        or "da giao" in s
+        or "delivered" in s
+    )
+
+def is_detail_delivered(detail_raw: dict) -> bool:
+    s = pick_columns_from_detail(detail_raw).get("status_text") or ""
+    if is_delivered_status_text(str(s)):
+        return True
+    return tree_contains_str(detail_raw, "label_order_delivered") or tree_contains_str(
+        detail_raw, "order_status_text_to_receive_delivery_done"
+    )
+
+def _confirm_error_is_already_done(raw_error_text: str, api_data=None) -> bool:
+    combined = []
+    if raw_error_text:
+        combined.append(str(raw_error_text))
+    if isinstance(api_data, dict):
+        for key in ("error_msg", "message", "msg", "error"):
+            val = str(api_data.get(key) or "").strip()
+            if val:
+                combined.append(val)
+        data_obj = api_data.get("data")
+        if isinstance(data_obj, dict):
+            if bool(data_obj.get("is_confirmed")):
+                return True
+            for key in ("message", "status_text", "status"):
+                val = str(data_obj.get(key) or "").strip()
+                if val:
+                    combined.append(val)
+    norm = " | ".join(combined).lower()
+    if "kindnotsupported" in norm and "categorydataorderinfo" in norm:
+        return True
+    if "is_confirmed" in norm:
+        return True
+    if "already" in norm and "confirm" in norm:
+        return True
+    if "đã xác nhận" in norm or "da xac nhan" in norm:
+        return True
+    return False
+
+def _humanize_confirm_error(raw_error_text: str, api_data=None) -> str:
+    text = str(raw_error_text or "").strip()
+    if not text and isinstance(api_data, dict):
+        text = str(
+            api_data.get("error_msg")
+            or api_data.get("message")
+            or api_data.get("msg")
+            or api_data.get("error")
+            or ""
+        ).strip()
+    norm = text.lower()
+    if _confirm_error_is_already_done(raw_error_text, api_data):
+        return "Don da xac nhan truoc do."
+    if "http 401" in norm:
+        return "Cookie het han hoac khong hop le (401)."
+    if "http 403" in norm:
+        return "Shopee tu choi yeu cau (403)."
+    if "http 429" in norm:
+        return "Bi gioi han tan suat (429), thu lai sau."
+    if not text:
+        return "Xac nhan don that bai."
+    return text[:220]
+
+def request_buyer_confirm_order(order_id: str, cookie_text: str):
+    order_id_val = str(order_id or "").strip()
+    cookie_val = sanitize_cookie(str(cookie_text or "").strip())
+    if not order_id_val:
+        return False, {}, "Thieu order_id."
+    if not cookie_val:
+        return False, {}, "Thieu cookie."
+
+    ckm = cookie_map(cookie_val)
+    csrf_val = str(ckm.get("csrftoken") or ckm.get("CSRFTOKEN") or "").strip()
+
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://shopee.vn",
+        "Referer": "https://shopee.vn/user/purchase/?type=8",
+        "User-Agent": SHOPEE_CONFIRM_UA,
+        "X-API-SOURCE": "pc",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Shopee-Language": "vi",
+        "x-shopee-language": "vi",
+        "Cookie": cookie_val,
+    }
+    if csrf_val:
+        headers["X-CSRFToken"] = csrf_val
+        headers["x-csrftoken"] = csrf_val
+
+    payload = {"order_id": int(order_id_val) if str(order_id_val).isdigit() else order_id_val}
+    status, body = http_post(SHOPEE_CONFIRM_URL, headers, payload=payload, timeout=15)
+
+    if status != 200:
+        msg = ""
+        if isinstance(body, dict):
+            msg = str(
+                body.get("message")
+                or body.get("msg")
+                or body.get("error_msg")
+                or body.get("error")
+                or ""
+            ).strip()
+        if not msg:
+            msg = f"HTTP {status or 0}"
+        return False, (body if isinstance(body, dict) else {}), msg
+
+    if not isinstance(body, dict):
+        return False, {}, "API confirm khong tra JSON hop le."
+
+    if body.get("ok") is False:
+        return False, body, str(body.get("error") or body.get("message") or "Xac nhan that bai.")
+
+    err = body.get("error")
+    if err not in (None, 0, "0", "", False):
+        msg = str(body.get("error_msg") or body.get("message") or err).strip()
+        return False, body, msg or "Xac nhan that bai."
+
+    msg = str(body.get("message") or body.get("msg") or "").strip()
+    if msg:
+        msg_norm = msg.lower()
+        if any(k in msg_norm for k in ("that bai", "khong", "loi", "error", "fail")):
+            return False, body, msg
+
+    return True, body, ""
+
 # ================== Routes ==================
 @app.get("/api/ping")
 def api_ping():
@@ -588,6 +938,7 @@ def api_check_cookie_single():
     cookie = (data.get("cookie") or "").strip()
     if not cookie:
         return jsonify({"error": "Missing cookie"}), 400
+    cookie = sanitize_cookie(cookie)
 
     # cho phép override (nếu bạn muốn)
     max_orders = data.get("max_orders", DEFAULT_MAX_ORDERS)
@@ -603,12 +954,15 @@ def api_check_cookie_single():
     except Exception:
         list_limit = DEFAULT_LIST_LIMIT
 
+    account_meta = fetch_shopee_account_info(cookie, timeout=10)
     fetched = fetch_orders_and_details(cookie, list_limit=list_limit, offset=0)
     details = fetched.get("details", []) if isinstance(fetched, dict) else []
     shopee_full = {
         "list_http_status": fetched.get("list_http_status") if isinstance(fetched, dict) else None,
         "list_raw": fetched.get("list_raw") if isinstance(fetched, dict) else None,
-        "details_raw": []
+        "details_raw": [],
+        "account_http_status": account_meta.get("http_status"),
+        "account_raw": account_meta.get("raw"),
     }
 
     picked = []
@@ -642,6 +996,8 @@ def api_check_cookie_single():
             "data_list": [],
             "count": 0,
             "message": "Cookie khóa/hết hạn hoặc không có đơn hợp lệ",
+            "user_shopee": account_meta.get("user"),
+            "cookie_live": bool(account_meta.get("live")),
             "shopee_full": shopee_full
         })
 
@@ -649,7 +1005,183 @@ def api_check_cookie_single():
         "data": picked[0],
         "data_list": picked,
         "count": len(picked),
+        "user_shopee": account_meta.get("user"),
+        "cookie_live": bool(account_meta.get("live")),
         "shopee_full": shopee_full
+    })
+
+@app.post("/api/confirm-order")
+def api_confirm_order():
+    data = request.get_json(silent=True) or {}
+    cookie = sanitize_cookie(str(data.get("cookie") or "").strip())
+    order_id = str(data.get("order_id") or "").strip()
+
+    if not cookie:
+        return jsonify({"ok": False, "error": "Missing cookie"}), 400
+    if not order_id:
+        return jsonify({"ok": False, "error": "Missing order_id"}), 400
+
+    ok_confirm, confirm_data, confirm_err = request_buyer_confirm_order(order_id, cookie)
+    if ok_confirm:
+        return jsonify({
+            "ok": True,
+            "state": "success",
+            "message": "Xac nhan thanh cong",
+            "order_id": order_id,
+            "api_data": confirm_data if isinstance(confirm_data, dict) else {},
+        })
+
+    if _confirm_error_is_already_done(confirm_err, confirm_data):
+        return jsonify({
+            "ok": True,
+            "state": "already",
+            "message": "Don da xac nhan truoc do",
+            "order_id": order_id,
+            "api_data": confirm_data if isinstance(confirm_data, dict) else {},
+        })
+
+    return jsonify({
+        "ok": False,
+        "state": "failed",
+        "message": _humanize_confirm_error(confirm_err, confirm_data),
+        "order_id": order_id,
+        "api_data": confirm_data if isinstance(confirm_data, dict) else {},
+    }), 400
+
+@app.post("/api/confirm-received-sll")
+def api_confirm_received_sll():
+    payload = request.get_json(silent=True) or {}
+    started = time.time()
+
+    order_limit = payload.get("order_limit", 6)
+    max_cookies = payload.get("max_cookies", 50)
+    try:
+        order_limit = max(1, min(int(order_limit), 12))
+    except Exception:
+        order_limit = 6
+    try:
+        max_cookies = max(1, min(int(max_cookies), 200))
+    except Exception:
+        max_cookies = 50
+
+    cookies_all = parse_cookie_inputs(payload)
+    input_count = len(cookies_all)
+    cookies = cookies_all[:max_cookies]
+    truncated_count = max(0, len(cookies_all) - len(cookies))
+
+    cookie_rows = []
+    order_rows = []
+
+    for ck in cookies:
+        row = {
+            "cookie": ck,
+            "cookie_preview": (ck[:56] + "...") if len(ck) > 56 else ck,
+            "live": False,
+            "delivered_count": 0,
+            "confirmed_count": 0,
+            "already_count": 0,
+            "failed_count": 0,
+            "note": "",
+            "order_api_error": "",
+        }
+
+        ids, meta = fetch_order_ids_with_meta(ck, limit=order_limit, offset=0, timeout=12)
+        row["order_api_error"] = str((meta or {}).get("error") or "").strip()
+        if not ids:
+            live_meta = fetch_shopee_account_info(ck, timeout=8)
+            row["live"] = bool(live_meta.get("live"))
+            if row["live"]:
+                row["note"] = row["order_api_error"] or "Khong co don gan day."
+            else:
+                row["note"] = str(live_meta.get("error") or "").strip() or "Cookie die/het han."
+            cookie_rows.append(row)
+            continue
+
+        row["live"] = True
+        seen_oid = set()
+        for oid in ids[:order_limit]:
+            oid = str(oid or "").strip()
+            if not oid or oid in seen_oid:
+                continue
+            seen_oid.add(oid)
+
+            detail, _detail_meta = fetch_order_detail_by_id(ck, oid, timeout=12)
+            if not isinstance(detail, dict) or not detail:
+                continue
+            if not is_detail_delivered(detail):
+                continue
+
+            row["delivered_count"] += 1
+            summary = pick_columns_from_detail(detail, fallback_order_id=oid)
+            tracking_no = summary.get("tracking_no")
+            status_text = summary.get("status_text") or "—"
+
+            ok_confirm, confirm_data, confirm_err = request_buyer_confirm_order(oid, ck)
+            confirm_state = "success"
+            result_text = "✅ Thanh cong"
+            if not ok_confirm:
+                if _confirm_error_is_already_done(confirm_err, confirm_data):
+                    ok_confirm = True
+                    confirm_state = "already"
+                    result_text = "ℹ️ Da xac nhan truoc do"
+                else:
+                    confirm_state = "failed"
+                    result_text = f"❌ {_humanize_confirm_error(confirm_err, confirm_data)}"
+
+            if ok_confirm:
+                row["confirmed_count"] += 1
+                if confirm_state == "already":
+                    row["already_count"] += 1
+            else:
+                row["failed_count"] += 1
+
+            order_rows.append({
+                "cookie_preview": row["cookie_preview"],
+                "order_id": oid,
+                "tracking_no": tracking_no,
+                "status_text": status_text,
+                "ok": bool(ok_confirm),
+                "state": confirm_state,
+                "result_text": result_text,
+                "api_data": confirm_data if isinstance(confirm_data, dict) else {},
+            })
+
+        if row["delivered_count"] <= 0:
+            row["note"] = "Khong co don GTC de xac nhan."
+        elif row["failed_count"] > 0:
+            row["note"] = f"Xac nhan {row['confirmed_count']}/{row['delivered_count']} don."
+        elif row["already_count"] > 0:
+            row["note"] = f"Da xac nhan/da co san {row['confirmed_count']} don."
+        else:
+            row["note"] = f"Da xac nhan {row['confirmed_count']} don."
+        cookie_rows.append(row)
+
+    for idx, row in enumerate(cookie_rows, start=1):
+        row["index"] = idx
+    for idx, row in enumerate(order_rows, start=1):
+        row["index"] = idx
+
+    live_count = sum(1 for r in cookie_rows if bool(r.get("live")))
+    delivered_count = sum(max(0, int(r.get("delivered_count") or 0)) for r in cookie_rows)
+    confirmed_count = sum(max(0, int(r.get("confirmed_count") or 0)) for r in cookie_rows)
+    already_count = sum(max(0, int(r.get("already_count") or 0)) for r in cookie_rows)
+    failed_count = sum(max(0, int(r.get("failed_count") or 0)) for r in cookie_rows)
+
+    return jsonify({
+        "ok": True,
+        "cookie_rows": cookie_rows,
+        "order_rows": order_rows,
+        "input_count": int(input_count),
+        "total": len(cookie_rows),
+        "live_count": int(live_count),
+        "die_count": int(len(cookie_rows) - live_count),
+        "delivered_count": int(delivered_count),
+        "confirmed_count": int(confirmed_count),
+        "already_count": int(already_count),
+        "failed_count": int(failed_count),
+        "elapsed": round(max(0.0, time.time() - started), 3),
+        "truncated_count": int(truncated_count),
+        "order_limit": int(order_limit),
     })
 
 # Vercel needs "app" exported
